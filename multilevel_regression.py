@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.stats.mstats import mquantiles
-from scipy.stats import boxcox
+from scipy.stats import boxcox, t
 from scipy.special import inv_boxcox
 import pymc3 as pm
 from sklearn.model_selection import KFold
@@ -13,38 +13,11 @@ sns.set_style('whitegrid')
 pd.set_option('display.max_columns', 100, 'display.max_rows', 100)
 
 
-def get_data():
-    # load data
-    srrs2 = pd.read_csv(pm.get_data('srrs2.dat'))
-    srrs2.columns = srrs2.columns.map(str.strip)
-    srrs2['county'] = srrs2['county'].str.strip()
-    srrs_mn = srrs2.loc[srrs2.state == 'MN', :].copy()
-    srrs_mn['fips'] = srrs_mn.stfips * 1000 + srrs_mn.cntyfips
-
-    cty = pd.read_csv(pm.get_data('cty.dat'))
-    cty_mn = cty.loc[cty.st == 'MN', :].copy()
-    cty_mn['fips'] = cty_mn.stfips * 1000 + cty_mn.ctfips
-
-    srrs_mn = srrs_mn.merge(cty_mn[['fips', 'Uppm']], on='fips')
-
-    # target (y)
-    y = srrs_mn['activity'].values
-    y_bc, lambda_bc = boxcox(y + 0.1)
-
-    # predictor (x)
-    x = srrs_mn[['floor']].values
-
-    # groups
-    group = pd.Categorical(srrs_mn['county'])
-    group_idx = group.codes
-
-    return srrs_mn, x, y, y_bc, lambda_bc, group, group_idx
-
-
 class MultiLevelModel(object):
     """
-    https://discourse.pymc.io/t/how-do-we-predict-on-new-unseen-groups-in-a-hierarchical-model-in-pymc3/2571/2
+    Base class for a multi-level model
     """
+
     def __init__(self):
         self.trace_ = None
         self.n_groups_ = None
@@ -54,35 +27,42 @@ class MultiLevelModel(object):
     def _build_model(self, X, y, **kwargs):
         raise NotImplementedError()
 
-    def train(self, X, y, draws=4000, tune=2000, chains=4, cores=4,
-              target_accept=.95, burn=500, **model_kwargs):
+    def fit(self, X, y, draws=4000, tune=2000, chains=4, cores=4,
+            target_accept=.8, burn=500, **model_kwargs):
+        """
 
-        with self._build_model(X=X, y=y, **model_kwargs) as m:
+        Parameters
+        ----------
+        X: numpy array
+            Shape should be (n_features, n_observations) e.g. df.values.T
+        y
+        draws
+        tune
+        chains
+        cores
+        target_accept
+        burn
+        model_kwargs
+
+        Returns
+        -------
+
+        """
+
+        self.model_ = self._build_model(X=X, y=y, **model_kwargs)
+
+        with self.model_:
             self.trace_ = pm.sample(
                 draws=draws, tune=tune, chains=chains,
                 cores=cores, target_accept=target_accept)[burn:]
 
-        self.model_ = m
-
         return self
 
-    def predict(self, X, varnames=None, samples=1000, **model_kwargs):
-        # dummy y to match shape of X
-        y = np.zeros(X.shape[0])
-
-        with self._build_model(X=X, y=y, **model_kwargs) as m:
-            # extract the learnt global effect from the train_trace
-            df = pm.trace_to_dataframe(self.trace_,
-                                       varnames=varnames,
-                                       include_transformed=True)
-
-            pred = pm.sample_posterior_predictive(trace=df.to_dict('records'),
-                                                  samples=samples)
-
-            return pred
+    def predict(self, X, **kwargs):
+        raise NotImplementedError()
 
 
-class PoolModel(MultiLevelModel):
+class PoolLinearModel(MultiLevelModel):
     def _build_model(self, X, y, **kwargs):
         with pm.Model() as model:
             # priors
@@ -91,7 +71,7 @@ class PoolModel(MultiLevelModel):
             sigma = pm.HalfNormal('sigma', sigma=1e5)
 
             # mean: linear regression
-            mu = alpha + pm.math.dot(X, beta)
+            mu = alpha + pm.math.dot(beta, X)
 
             # degree of freedom
             nu = pm.Exponential('nu', 1 / 30)
@@ -101,28 +81,50 @@ class PoolModel(MultiLevelModel):
 
         return model
 
+    def predict(self, X, **kwargs):
+        """
+
+        Parameters
+        ----------
+        X: np.array
+            Must be a 2d array (n_observations, n_features)
+        kwargs
+
+        Returns
+        -------
+
+        """
+        mu = self.trace_['alpha'] + self.trace_['beta'] * X[:, None]
+        dist = t(df=self.trace_['nu'], loc=mu, scale=self.trace_['sigma'])
+        if kwargs.get('q') is None:
+            return dist, dist.mean().mean(axis=2)
+        else:
+            return dist, [dist.ppf(q_).mean(axis=2) for q_ in kwargs['q']]
+
 
 class UnpoolModel(MultiLevelModel):
     def _build_model(self, X, y, **kwargs):
         group_idx = kwargs['group_idx']
+        n_groups = np.unique(group_idx).shape[0]
+        n_features = X.shape[-1]
 
-        if self.n_groups_ is None:
-            self.n_groups_ = np.unique(group_idx).shape[0]
-
-        if self.n_features_ is None:
-            self.n_features_ = X.shape[-1]
+        # if self.n_groups_ is None:
+        #     self.n_groups_ = np.unique(group_idx).shape[0]
+        #
+        # if self.n_features_ is None:
+        #     self.n_features_ = X.shape[-1]
 
         with pm.Model() as model:
             # priors
-            alpha = pm.Normal('alpha', mu=0, sigma=1e5, shape=(self.n_features_, self.n_groups_))
-            beta = pm.Normal('beta', mu=0, sigma=1e5, shape=(self.n_features_, self.n_groups_))
+            alpha = pm.Normal('alpha', mu=0, sigma=1e5, shape=(n_features, n_groups))
+            beta = pm.Normal('beta', mu=0, sigma=1e5, shape=(n_features, n_groups))
             sigma = pm.HalfNormal('sigma', sigma=1e5)
 
             # mean: linear regression
             mu = alpha[:, group_idx] + pm.math.dot(X, beta[:, group_idx])
 
             # degree of freedom
-            nu = pm.Exponential('nu', 1 / 30)
+            nu = pm.Exponential('nu', 1 / 30.)
 
             # observations
             pm.StudentT('y', mu=mu, sigma=sigma, nu=nu, observed=y)
@@ -197,18 +199,19 @@ class PartialPoolModel(MultiLevelModel):
         return model
 
 
-def plot_prediction(x, y, prob=(0.025, 0.5, 0.975), xlabel=None, ylabel=None,
-                    ci=True, ax=None, figsize=(18, 6), **kwargs):
+def plot_prediction(x, y_mean, y_upper=None, y_lower=None, xlabel=None, ylabel=None,
+                    ax=None, figsize=(18, 6), **kwargs):
     if ax is None:
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111)
     else:
         fig = ax.get_figure()
 
-    q = mquantiles(y, prob=prob, axis=0)
-    ax.plot(x, q[1], **kwargs)
-    if ci:
-        ax.fill_between(x, q[0], q[2], alpha=0.5)
+    # q = mquantiles(y, prob=prob, axis=0)
+    ax.plot(x, y_mean, **kwargs)
+    if not (y_upper is None or y_lower is None):
+        ax.fill_between(x, y_upper, y_lower, alpha=kwargs.get('alpha', 0.5))
+
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.legend()
@@ -231,47 +234,74 @@ def cv(func, X, y, n_splits, random_state=None):
 
 
 if __name__ == '__main__':
+    def get_data():
+        # load data
+        srrs2 = pd.read_csv(pm.get_data('srrs2.dat'))
+        srrs2.columns = srrs2.columns.map(str.strip)
+        srrs2['county'] = srrs2['county'].str.strip()
+        srrs_mn = srrs2.loc[srrs2.state == 'MN', :].copy()
+        srrs_mn['fips'] = srrs_mn.stfips * 1000 + srrs_mn.cntyfips
+
+        cty = pd.read_csv(pm.get_data('cty.dat'))
+        cty_mn = cty.loc[cty.st == 'MN', :].copy()
+        cty_mn['fips'] = cty_mn.stfips * 1000 + cty_mn.ctfips
+
+        srrs_mn = srrs_mn.merge(cty_mn[['fips', 'Uppm']], on='fips')
+
+        # target (y)
+        y = srrs_mn['activity'].values
+        y_bc, lambda_bc = boxcox(y + 0.1)
+
+        # predictor (x)
+        x = srrs_mn[['floor']].values.T
+
+        # groups
+        group = pd.Categorical(srrs_mn['county'])
+        group_idx = group.codes
+
+        return srrs_mn, x, y, y_bc, lambda_bc, group, group_idx
+
+
     dataset, x, y, y_bc, lambda_bc, group, group_idx = get_data()
 
-    # model = PoolModel()
-    # model.train(x, y_bc, draws=3000, tune=2000, chains=4, cores=4, target_accept=.85, burn=500)
+    model = PoolLinearModel()
+    model.fit(x, y_bc, draws=1000, tune=500, chains=2, cores=4, target_accept=.85, burn=100)
+
+    x_ = np.linspace(x.min(), x.max(), 20)[:, None]
+    y_dist, y_pred = model.predict(x_, q=(0.025, 0.5, 0.975))
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(x, y_bc)
+    plot_prediction(x_, y_mean=y_pred[1], y_upper=y_pred[0], y_lower=y_pred[2], xlabel='floor',
+                    ylabel='BoxCox(radon activity)', ax=ax, linestyle='--', c='b', label='pooled')
+
+    # model = UnpoolModel()
+    # model.train(x, y_bc, draws=30, tune=30, chains=1, cores=4, target_accept=.85, burn=0, group_idx=group_idx)
+    # x_ = np.linspace(x.min(), x.max(), 50).reshape(-1, 1)
+    # y_pred = model.predict(x_, samples=500, group_idx=np.ones(50, dtype=np.int16) * 4)['y']
     #
-    # x_ = np.linspace(x.min(), x.max(), 50)
-    # y_pred = model.predict(x_, samples=1000)['y']
+    # idx = range(0, group.categories.shape[0], 10)
+    # selected_county = group.value_counts().sort_values(ascending=False).iloc[idx].index.tolist()
     #
-    # fig, ax = plt.subplots(figsize=(7, 6))
-    # ax.scatter(x, y_bc)
-    # plot_prediction(x_, y_pred, xlabel='floor', ylabel='BoxCox(radon activity)', ci=True,
-    #                 ax=ax, linestyle='--', c='b', label='pooled')
-
-    model = UnpoolModel()
-    model.train(x, y_bc, draws=30, tune=30, chains=1, cores=4, target_accept=.85, burn=0, group_idx=group_idx)
-    x_ = np.linspace(x.min(), x.max(), 50).reshape(-1, 1)
-    y_pred = model.predict(x_, samples=500, group_idx=np.ones(50, dtype=np.int16) * 4)['y']
-
-    idx = range(0, group.categories.shape[0], 10)
-    selected_county = group.value_counts().sort_values(ascending=False).iloc[idx].index.tolist()
-
-    fig, ax = plt.subplots(2, 5, figsize=(18, 7), sharex=True, sharey=True)
-    ax_ = ax.ravel()
-
-    for i, county in enumerate(selected_county):
-        # plot observed data points
-        mask = dataset['county'] == county
-        ax_[i].scatter(x[mask], y_bc[mask])
-        j = np.where(group.categories == county)[0][0]
-        x = np.linspace(x.min(), x.max(), 50)
-
-        # compare pooled and unpooled models
-        # pooled model
-        plot_prediction(x, y_pooled, xlabel='floor', ylabel='BoxCox(radon activity)', ci=True, ax=ax_[i],
-                        linestyle='--', c='b', label='pooled')
-
-        # unpooled model
-        y_unpooled = chain_unpooled['alpha'][:, j] + chain_unpooled['beta'][:, j] * x[:, None]
-        plot_prediction(x, y_unpooled, xlabel='floor', ylabel='BoxCox(radon activity)', ci=True, ax=ax_[i],
-                        linestyle='-.', c='g', label='unpooled')
+    # fig, ax = plt.subplots(2, 5, figsize=(18, 7), sharex=True, sharey=True)
+    # ax_ = ax.ravel()
+    #
+    # for i, county in enumerate(selected_county):
+    #     # plot observed data points
+    #     mask = dataset['county'] == county
+    #     ax_[i].scatter(x[mask], y_bc[mask])
+    #     j = np.where(group.categories == county)[0][0]
+    #     x = np.linspace(x.min(), x.max(), 50)
+    #
+    #     # compare pooled and unpooled models
+    #     # pooled model
+    #     plot_prediction(x, y_pooled, xlabel='floor', ylabel='BoxCox(radon activity)', ci=True, ax=ax_[i],
+    #                     linestyle='--', c='b', label='pooled')
+    #
+    #     # unpooled model
+    #     y_unpooled = chain_unpooled['alpha'][:, j] + chain_unpooled['beta'][:, j] * x[:, None]
+    #     plot_prediction(x, y_unpooled, xlabel='floor', ylabel='BoxCox(radon activity)', ci=True, ax=ax_[i],
+    #                     linestyle='-.', c='g', label='unpooled')
 
     fig.tight_layout()
-    plt.show()
     plt.show()
